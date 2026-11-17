@@ -1,0 +1,182 @@
+# Converted from upstream egm-drift-report by @keeb/skill-converter, then hand-finished.
+id: a3bf2b73-8f31-4cca-9391-6efb1caf90b1
+name: "@sntxrr/egm-drift-report"
+description: >-
+  Check every design document or README in docsDir for drift against the code
+  under repoRoot. Each document gets its own isolated claude session with
+  read-only Read/Grep/Glob confined to repoRoot. Writes
+  {YYYY-MM-DD}_DRIFT_REPORT.md in upstream's strict per-document format and
+  records per-document drift counts, so a scheduled run can fail on new drift
+  (failOnNewDrift).
+version: 1
+inputs:
+  properties:
+    repoRoot:
+      type: string
+      description: Source tree root (absolute, or relative to the swamp repo).
+    docsDir:
+      type: string
+      description: Directory of design documents or READMEs, absolute or relative to repoRoot.
+    glob:
+      type: string
+      description: Document glob relative to docsDir.
+      default: "**/*.md"
+    excludeGlobs:
+      type: array
+      items:
+        type: string
+      description: Globs excluded from the document and source listings.
+      default:
+        - "**/node_modules/**"
+        - "**/vendor/**"
+        - "**/.git/**"
+    sourceGlob:
+      type: string
+      description: Optional source glob (relative to repoRoot) for the repo-wide 'Unreferenced code' section. Empty skips it.
+      default: ""
+    reportDir:
+      type: string
+      description: Directory for the dated report, relative to repoRoot. Empty means repoRoot.
+      default: ""
+    reportDate:
+      type: string
+      description: YYYY-MM-DD for the file name. Empty means today (UTC).
+      default: ""
+    appendReport:
+      type: boolean
+      description: Append to an existing report for the same date instead of rewriting it.
+      default: false
+    model:
+      type: string
+      default: claude-opus-5-5
+    effort:
+      type: string
+      enum: [low, medium, high, xhigh, max]
+      default: high
+    concurrency:
+      type: integer
+      description: Documents analyzed in parallel (each in its own session).
+      default: 2
+    timeoutSeconds:
+      type: integer
+      default: 900
+    failOnNewDrift:
+      type: boolean
+      description: Fail the run when any document's drift count went up since the previous run.
+      default: false
+  required:
+    - repoRoot
+    - docsDir
+jobs:
+  - name: drift
+    description: List documents, analyze each in isolation, write the dated report.
+    steps:
+      - name: prepare
+        description: List documents and build one read-only request per document.
+        task:
+          type: model_method
+          modelType: "@sntxrr/egm/drift"
+          modelName: egm-drift
+          methodName: prepare
+          globalArgs:
+            repoRoot: ${{ inputs.repoRoot }}
+            docsDir: ${{ inputs.docsDir }}
+          inputs:
+            glob: ${{ inputs.glob }}
+            excludeGlobs: ${{ inputs.excludeGlobs }}
+            sourceGlob: ${{ inputs.sourceGlob }}
+
+      - name: assert-docs-found
+        description: At least one document must match.
+        dependsOn:
+          - step: prepare
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: data.latest("egm-drift", "plan").attributes.docCount > 0
+          message: No documents matched glob in docsDir; check docsDir, glob and excludeGlobs.
+          severity: high
+
+      - name: analyze-docs
+        description: One isolated claude session per document, read-only tools rooted at repoRoot.
+        dependsOn:
+          - step: assert-docs-found
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@keeb/anthropic/claude"
+          modelName: egm-drift-claude
+          methodName: cli_generate_many_tools
+          globalArgs:
+            model: ${{ inputs.model }}
+          inputs:
+            batch: ${{ data.latest("egm-drift", "plan").attributes.batch }}
+            requests: ${{ data.latest("egm-drift", "plan").attributes.requests }}
+            cwd: ${{ data.latest("egm-drift", "plan").attributes.repoRoot }}
+            systemPrompt: You check one design document against the current code, read-only. Report only differences. Respond only with JSON matching the requested schema.
+            effort: ${{ inputs.effort }}
+            concurrency: ${{ inputs.concurrency }}
+            timeoutSeconds: ${{ inputs.timeoutSeconds }}
+
+      - name: collect-findings
+        description: Validate each document's answer; optional repo-wide unreferenced-file check.
+        dependsOn:
+          - step: analyze-docs
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@sntxrr/egm/drift"
+          modelName: egm-drift
+          methodName: collectFindings
+          globalArgs:
+            repoRoot: ${{ inputs.repoRoot }}
+            docsDir: ${{ inputs.docsDir }}
+          inputs:
+            resultsModel: egm-drift-claude
+
+      - name: write-report
+        description: Write {YYYY-MM-DD}_DRIFT_REPORT.md and per-document counts against the previous run.
+        dependsOn:
+          - step: collect-findings
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@sntxrr/egm/drift"
+          modelName: egm-drift
+          methodName: writeReport
+          globalArgs:
+            repoRoot: ${{ inputs.repoRoot }}
+            docsDir: ${{ inputs.docsDir }}
+          inputs:
+            reportDir: ${{ inputs.reportDir }}
+            reportDate: ${{ inputs.reportDate }}
+            append: ${{ inputs.appendReport }}
+
+      - name: assert-all-docs-analyzed
+        description: Every document must have a valid analysis. Failures appear in the report as [error] entries.
+        dependsOn:
+          - step: write-report
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: size(data.latest("egm-drift", "report").attributes.errors) == 0
+          message: One or more documents could not be analyzed (claude error, timeout or invalid answer); see the [error] entries in the report.
+          severity: high
+
+      - name: assert-no-new-drift
+        description: For scheduled runs. Skipped unless failOnNewDrift is true.
+        dependsOn:
+          - step: write-report
+            condition:
+              type: succeeded
+        guard: ${{ !inputs.failOnNewDrift }}
+        task:
+          type: assert
+          expr: data.latest("egm-drift", "report").attributes.newDriftCount == 0
+          message: New drift since the previous run; see newDriftDocs in the egm-drift report data.
+          severity: high

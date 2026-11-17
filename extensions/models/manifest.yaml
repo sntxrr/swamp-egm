@@ -1,0 +1,47 @@
+manifestVersion: 1
+
+name: "@sntxrr/egm"
+version: "2026.11.17.1"
+description: "Elephant-Goldfish Model (egm.dev) design-document review, drift reports and finding resolution as swamp workflows: isolated Goldfish reviewer sessions via the local claude CLI, structured findings, consolidated reports, gated fixes"
+repository: "https://github.com/sntxrr/swamp-egm"
+license: Apache-2.0
+
+models:
+  - egm.ts
+  - egm_drift.ts
+  - egm_resolve.ts
+  - egm_claude_tools.ts
+
+workflows:
+  - workflow-egm-review.yaml
+  - workflow-egm-drift-report.yaml
+  - workflow-egm-resolve.yaml
+
+skills:
+  - egm-swamp
+
+additionalFiles:
+  - README.md
+  - LICENSE
+  - NOTICE
+  - egm/prompts/agents/codebase_details.md
+  - egm/prompts/agents/comprehension.md
+  - egm/prompts/agents/design_critic.md
+  - egm/prompts/agents/implementation_readiness.md
+  - egm/prompts/agents/inventive_catalyst.md
+  - egm/prompts/agents/structural.md
+  - egm/prompts/agents/style.md
+  - egm/prompts/agents/zoom_out.md
+  - egm/prompts/standards/feature-spec-standard.md
+  - egm/prompts/standards/implementation-readiness-standard.md
+  - egm/prompts/standards/zoom-out-standard.md
+
+dependencies:
+  - "@keeb/anthropic"
+
+labels:
+  - egm
+  - design-review
+  - llm
+  - claude
+  - documentation

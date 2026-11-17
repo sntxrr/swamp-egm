@@ -1,0 +1,254 @@
+# Converted from upstream egm-review by @keeb/skill-converter, then hand-finished.
+id: 4bbc7647-0d14-48a4-b411-98d9095392be
+name: "@sntxrr/egm-review"
+description: >-
+  EGM Goldfish review of a design document, without interactive gates. Each
+  selected stage's reviewer personas read the document as separate, isolated
+  Claude CLI sessions (zoom-out and codebase-details also get read-only
+  Read/Grep/Glob over workingDirectory). Failed reviewers are retried once; one
+  synthesizer call deduplicates and consolidates the findings; per-stage reports
+  and consolidated_review_report.md (with a traceability matrix) are written.
+  The document is never edited; run @sntxrr/egm-resolve for that.
+version: 1
+inputs:
+  properties:
+    targetFile:
+      type: string
+      description: Design document to review, absolute or relative to workingDirectory.
+    workingDirectory:
+      type: string
+      description: Repository root. Linked files must stay inside it; tool-enabled reviewers may read it.
+      default: "."
+    outputDir:
+      type: string
+      description: Folder for the report files, relative to workingDirectory.
+      default: "."
+    goldfishContext:
+      type: array
+      items:
+        type: string
+      description: Extra context files for every stage except 6 (comprehension). In-tree links in the document are added automatically.
+      default: []
+    preset:
+      type: string
+      enum: [uninterrupted, feature_spec, implementation]
+      description: uninterrupted = stages 5-9; feature_spec = 5-8 on the whole document; implementation = 9 only.
+      default: uninterrupted
+    stages:
+      type: array
+      items:
+        type: integer
+      description: Explicit stage list (5-9). Overrides the preset when not empty.
+      default: []
+    personas:
+      type: object
+      description: 'Per-stage reviewer override, e.g. {"7": ["design", "style"]}.'
+      default: {}
+    approvedExternalLinks:
+      type: array
+      items:
+        type: string
+      description: Links outside workingDirectory, or URLs, approved as context. All others are excluded and listed in the report.
+      default: []
+    splitLine:
+      type: integer
+      description: Manual feature/implementation boundary line when the document has several candidate headers. 0 = auto.
+      default: 0
+    instancesPerReviewer:
+      type: integer
+      description: Independent copies (A, B, C) of each reviewer, for recall.
+      default: 1
+    model:
+      type: string
+      description: Claude model for reviewers and the synthesizer.
+      default: claude-opus-5-5
+    effort:
+      type: string
+      enum: [low, medium, high, xhigh, max]
+      default: high
+    concurrency:
+      type: integer
+      description: Reviewer sessions running at once.
+      default: 4
+    timeoutSeconds:
+      type: integer
+      description: Time limit per reviewer session.
+      default: 900
+  required:
+    - targetFile
+jobs:
+  - name: review
+    description: Prepare, fan out the Goldfish reviewers, retry failures once, synthesize, and write the reports.
+    steps:
+      - name: prepare
+        description: Split discovery, context resolution, and one isolated prompt per reviewer.
+        task:
+          type: model_method
+          modelType: "@sntxrr/egm"
+          modelName: egm-doc
+          methodName: prepare
+          globalArgs:
+            workingDirectory: ${{ inputs.workingDirectory }}
+            outputDir: ${{ inputs.outputDir }}
+          inputs:
+            targetFile: ${{ inputs.targetFile }}
+            goldfishContext: ${{ inputs.goldfishContext }}
+            preset: ${{ inputs.preset }}
+            stages: ${{ inputs.stages }}
+            personas: ${{ inputs.personas }}
+            approvedExternalLinks: ${{ inputs.approvedExternalLinks }}
+            splitLine: ${{ inputs.splitLine }}
+            instancesPerReviewer: ${{ inputs.instancesPerReviewer }}
+
+      - name: run-reviewers
+        description: Every reviewer in its own claude session; tool-less ones in an empty directory.
+        dependsOn:
+          - step: prepare
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@keeb/anthropic/claude"
+          modelName: egm-goldfish
+          methodName: cli_generate_many_tools
+          globalArgs:
+            model: ${{ inputs.model }}
+          inputs:
+            batch: ${{ data.latest("egm-doc", "reviewPlan").attributes.batch }}
+            requests: ${{ data.latest("egm-doc", "reviewPlan").attributes.requests }}
+            cwd: ${{ data.latest("egm-doc", "reviewPlan").attributes.workingDirectory }}
+            systemPrompt: You are a stateless, read-only Goldfish reviewer. Use only the material in the prompt and, if you have tools, the repository. Respond only with JSON matching the requested schema.
+            effort: ${{ inputs.effort }}
+            concurrency: ${{ inputs.concurrency }}
+            timeoutSeconds: ${{ inputs.timeoutSeconds }}
+
+      - name: collect-findings
+        description: Validate answers, number findings, mark reviewers, queue failures for one retry.
+        dependsOn:
+          - step: run-reviewers
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@sntxrr/egm"
+          modelName: egm-doc
+          methodName: collectFindings
+          globalArgs:
+            workingDirectory: ${{ inputs.workingDirectory }}
+            outputDir: ${{ inputs.outputDir }}
+          inputs:
+            resultsModel: egm-goldfish
+            merge: false
+
+      - name: retry-failed-reviewers
+        description: Retry, once, every reviewer that errored, timed out or failed the schema. Skipped when none failed.
+        dependsOn:
+          - step: collect-findings
+            condition:
+              type: succeeded
+        guard: ${{ size(data.latest("egm-doc", "findings").?attributes.?retryRequests.orValue([])) == 0 }}
+        allowFailure: true
+        task:
+          type: model_method
+          modelType: "@keeb/anthropic/claude"
+          modelName: egm-goldfish
+          methodName: cli_generate_many_tools
+          globalArgs:
+            model: ${{ inputs.model }}
+          inputs:
+            batch: ${{ data.latest("egm-doc", "findings").attributes.retryBatch }}
+            requests: ${{ data.latest("egm-doc", "findings").attributes.retryRequests }}
+            cwd: ${{ data.latest("egm-doc", "reviewPlan").attributes.workingDirectory }}
+            systemPrompt: You are a stateless, read-only Goldfish reviewer. Use only the material in the prompt and, if you have tools, the repository. Respond only with JSON matching the requested schema.
+            effort: ${{ inputs.effort }}
+            concurrency: ${{ inputs.concurrency }}
+            timeoutSeconds: ${{ inputs.timeoutSeconds }}
+
+      - name: merge-retry-findings
+        description: Fold retry results in; reviewers that still fail are 'not run'. Skipped when nothing was retried.
+        dependsOn:
+          - step: collect-findings
+            condition:
+              type: succeeded
+          - step: retry-failed-reviewers
+            condition:
+              type: or
+              conditions:
+                - type: completed
+                - type: skipped
+        guard: ${{ size(data.latest("egm-doc", "findings").?attributes.?retryRequests.orValue([])) == 0 }}
+        task:
+          type: model_method
+          modelType: "@sntxrr/egm"
+          modelName: egm-doc
+          methodName: collectFindings
+          globalArgs:
+            workingDirectory: ${{ inputs.workingDirectory }}
+            outputDir: ${{ inputs.outputDir }}
+          inputs:
+            resultsModel: egm-goldfish
+            merge: true
+
+      - name: assert-some-reviewer-completed
+        description: At least one reviewer must have produced a valid answer.
+        dependsOn:
+          - step: merge-retry-findings
+            condition:
+              type: or
+              conditions:
+                - type: succeeded
+                - type: skipped
+        task:
+          type: assert
+          expr: data.latest("egm-doc", "findings").attributes.reviewers.exists(r, r.status == "completed")
+          message: Every Goldfish reviewer failed, even after a retry. Check the claude CLI login and timeoutSeconds.
+          severity: high
+
+      - name: run-synthesizer
+        description: One isolated claude call that deduplicates per stage and consolidates across stages, keeping source ids.
+        dependsOn:
+          - step: assert-some-reviewer-completed
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@keeb/anthropic/claude"
+          modelName: egm-synthesizer
+          methodName: cli_generate
+          globalArgs:
+            model: ${{ inputs.model }}
+          inputs:
+            prompt: ${{ data.latest("egm-doc", "findings").attributes.synthesisPrompt }}
+            jsonSchema: ${{ data.latest("egm-doc", "findings").attributes.synthesisSchema }}
+            effort: ${{ inputs.effort }}
+            timeoutSeconds: ${{ inputs.timeoutSeconds }}
+
+      - name: write-reports
+        description: Per-stage reports, comprehension_report.md (paraphrase verbatim), consolidated_review_report.md.
+        dependsOn:
+          - step: run-synthesizer
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@sntxrr/egm"
+          modelName: egm-doc
+          methodName: writeReports
+          globalArgs:
+            workingDirectory: ${{ inputs.workingDirectory }}
+            outputDir: ${{ inputs.outputDir }}
+          inputs:
+            synthesis: ${{ data.latest("egm-synthesizer", "result").attributes.structured }}
+
+      - name: assert-all-findings-traced
+        description: Every raw finding must map to an action item (untraced ones are still listed in the report).
+        dependsOn:
+          - step: write-reports
+            condition:
+              type: succeeded
+        allowFailure: true
+        task:
+          type: assert
+          expr: size(data.latest("egm-doc", "reports").attributes.untracedFindingIds) == 0
+          message: The synthesizer left raw findings untraced; they are listed under 'Untraced findings' in consolidated_review_report.md.
+          severity: medium
