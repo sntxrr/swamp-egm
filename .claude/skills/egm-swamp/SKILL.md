@@ -81,8 +81,12 @@ swamp workflow run @sntxrr/egm-drift-report \
 
 Writes `<repoRoot>/<YYYY-MM-DD>_DRIFT_REPORT.md` in upstream's strict format
 (`## <doc>` then bullets or `No drift detected.`). With `failOnNewDrift`, the
-run fails when any document's drift count rose since the previous run, which
-suits a scheduled trigger.
+run fails on new drift, which suits a scheduled trigger. Drift counts are model
+output and move by an item or so on unchanged code, so new drift means a
+document's count rose by at least `minNewItems` (default 2) **and** the
+document or a source file read for it changed since the previous run. The
+first run is a baseline and never fails; rises on unchanged inputs are listed
+in `suppressedDocs` in the report data instead.
 
 ## Cost and models
 

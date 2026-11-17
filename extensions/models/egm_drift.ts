@@ -9,8 +9,10 @@
  * `collectFindings` validates the answers and, optionally, lists source files
  * no document mentions. `writeReport` writes `{YYYY-MM-DD}_DRIFT_REPORT.md` in
  * upstream egm-drift-report's strict per-document format and records
- * per-document drift counts against the previous run, so a scheduled run can
- * fail on new drift.
+ * per-document drift counts and input hashes against the previous run, so a
+ * scheduled run can fail on new drift. Counts are model output and vary on
+ * unchanged code, so a rise counts as new drift only when the document or a
+ * source file read for it changed (see `diffCounts`).
  *
  * Upstream: https://github.com/google/elephant-goldfish-model (Apache-2.0).
  *
@@ -155,20 +157,42 @@ const DriftFindingsSchema = z.object({
 
 type DriftFindings = z.infer<typeof DriftFindingsSchema>;
 
+/**
+ * What a document's drift answer was based on: the document's hash and the
+ * hash of every source file a reviewer read for it ("absent" when missing).
+ */
+const DocInputsSchema = z.object({
+  docSha: z.string(),
+  files: z.record(z.string(), z.string()),
+});
+
+/** Per-document inputs, keyed by document path. */
+export type DocInputs = z.infer<typeof DocInputsSchema>;
+
+const CountChangeSchema = z.object({
+  doc: z.string(),
+  previous: z.number(),
+  current: z.number(),
+});
+
 const DriftReportSchema = z.object({
   path: z.string(),
   date: z.string(),
   sha256: z.string(),
   perDocCounts: z.record(z.string(), z.number()),
+  inputs: z.record(z.string(), DocInputsSchema),
   totalDrift: z.number(),
   errors: z.array(z.string()),
   previousPerDocCounts: z.record(z.string(), z.number()).nullable(),
-  newDriftDocs: z.array(z.object({
-    doc: z.string(),
-    previous: z.number(),
-    current: z.number(),
-  })),
+  baseline: z.boolean(),
+  baselineDocs: z.array(z.string()),
+  minNewItems: z.number(),
+  changedDocs: z.array(z.string()),
+  newDriftDocs: z.array(CountChangeSchema),
   newDriftCount: z.number(),
+  suppressedDocs: z.array(CountChangeSchema.extend({
+    reason: z.enum(["inputs_unchanged", "below_threshold"]),
+  })),
   resolvedDocs: z.array(z.string()),
   timestamp: z.string(),
 });
@@ -197,13 +221,55 @@ interface Ctx {
 
 // ---------------------------------------------------------------- helpers
 
-async function sha256(text: string): Promise<string> {
-  const buf = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(text),
-  );
+async function sha256(data: string | Uint8Array): Promise<string> {
+  const bytes = typeof data === "string"
+    ? new TextEncoder().encode(data)
+    : data;
+  const buf = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+/** Most source files hashed per document; the rest are ignored. */
+const MAX_INPUT_FILES = 500;
+
+/** Files larger than this are fingerprinted by size and mtime instead of read. */
+const MAX_HASH_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Hashes source files by repo-relative path. Paths come from reviewer output,
+ * so anything that resolves outside repoRoot, or isn't a file, is skipped.
+ * A missing file hashes as "absent"; one over MAX_HASH_BYTES as its size and
+ * mtime. Exported for tests.
+ */
+export async function hashSourceFiles(
+  repoRoot: string,
+  paths: string[],
+): Promise<Record<string, string>> {
+  const root = repoRoot.replace(/\/$/, "");
+  const out: Record<string, string> = {};
+  for (const raw of paths) {
+    if (Object.keys(out).length >= MAX_INPUT_FILES) break;
+    const rel = relTo(root, raw.trim()).replace(/^\.\//, "")
+      .replace(/[#:].*$/, "");
+    if (!rel || rel.startsWith("/") || rel.split("/").includes("..")) continue;
+    if (rel in out) continue;
+    const abs = `${root}/${rel}`;
+    let real: string;
+    try {
+      real = await Deno.realPath(abs);
+    } catch {
+      out[rel] = "absent";
+      continue;
+    }
+    if (!real.startsWith(`${root}/`)) continue;
+    const st = await Deno.stat(real);
+    if (!st.isFile) continue;
+    out[rel] = st.size > MAX_HASH_BYTES
+      ? `large:${st.size}:${st.mtime?.getTime() ?? 0}`
+      : await sha256(await Deno.readFile(real));
+  }
+  return out;
 }
 
 function resolvePath(base: string, p: string): string {
@@ -526,6 +592,9 @@ const WriteArgs = z.object({
   append: z.boolean().default(false).describe(
     "Append to an existing report for the same date instead of rewriting it",
   ),
+  minNewItems: z.number().int().min(1).default(2).describe(
+    "A document counts as new drift only when its count rose by at least this much (and its inputs changed)",
+  ),
 });
 
 /** Renders the strict upstream report body. Exported for tests. */
@@ -557,23 +626,81 @@ export function renderDriftReport(f: DriftFindings): string {
   return out.join("\n");
 }
 
-/** Compares counts with the previous run. Exported for tests. */
-export function diffCounts(
-  previous: Record<string, number> | null,
-  current: Record<string, number>,
-): {
-  newDriftDocs: { doc: string; previous: number; current: number }[];
+/** True when a document or any source file read for it changed. Exported for tests. */
+export function inputsChanged(
+  previous: DocInputs | undefined,
+  current: DocInputs,
+): boolean {
+  if (!previous || previous.docSha !== current.docSha) return true;
+  return Object.entries(previous.files).some(([p, h]) =>
+    current.files[p] !== h
+  );
+}
+
+type CountChange = { doc: string; previous: number; current: number };
+
+/**
+ * Compares this run's counts with the previous run's. Drift counts are model
+ * output and wobble by an item or two on unchanged code, so a document is new
+ * drift only when (1) there was a previous run that recorded its inputs, (2)
+ * its count rose by at least minNewItems, and (3) the document or a source
+ * file read for it changed. A first run, a previous run from before inputs
+ * were recorded, and a document seen for the first time are baselines.
+ * Exported for tests.
+ */
+export function diffCounts(opts: {
+  previous: Record<string, number> | null;
+  previousInputs: Record<string, DocInputs> | null;
+  current: Record<string, number>;
+  currentInputs: Record<string, DocInputs>;
+  minNewItems: number;
+}): {
+  baseline: boolean;
+  baselineDocs: string[];
+  changedDocs: string[];
+  newDriftDocs: CountChange[];
+  suppressedDocs: (CountChange & {
+    reason: "inputs_unchanged" | "below_threshold";
+  })[];
   resolvedDocs: string[];
 } {
-  const newDriftDocs = Object.entries(current)
-    .filter(([doc, n]) => n > (previous?.[doc] ?? 0))
-    .map(([doc, n]) => ({ doc, previous: previous?.[doc] ?? 0, current: n }));
+  const { previous, previousInputs, current, currentInputs, minNewItems } =
+    opts;
+  const baseline = previous === null || previousInputs === null;
+  const baselineDocs: string[] = [];
+  const changedDocs: string[] = [];
+  const newDriftDocs: CountChange[] = [];
+  const suppressedDocs: (CountChange & {
+    reason: "inputs_unchanged" | "below_threshold";
+  })[] = [];
+  for (const [doc, n] of Object.entries(current)) {
+    if (baseline || !(doc in previous!) || !previousInputs![doc]) {
+      baselineDocs.push(doc);
+      continue;
+    }
+    const changed = inputsChanged(previousInputs![doc], currentInputs[doc]);
+    if (changed) changedDocs.push(doc);
+    const prev = previous![doc];
+    if (n <= prev) continue;
+    const c = { doc, previous: prev, current: n };
+    if (!changed) suppressedDocs.push({ ...c, reason: "inputs_unchanged" });
+    else if (n - prev < minNewItems) {
+      suppressedDocs.push({ ...c, reason: "below_threshold" });
+    } else newDriftDocs.push(c);
+  }
   const resolvedDocs = previous
     ? Object.entries(previous)
       .filter(([doc, n]) => n > 0 && current[doc] === 0)
       .map(([doc]) => doc)
     : [];
-  return { newDriftDocs, resolvedDocs };
+  return {
+    baseline,
+    baselineDocs,
+    changedDocs,
+    newDriftDocs,
+    suppressedDocs,
+    resolvedDocs,
+  };
 }
 
 async function writeReport(
@@ -599,6 +726,12 @@ async function writeReport(
   const previous = prevRaw
     ? DriftReportSchema.shape.perDocCounts.safeParse(prevRaw.perDocCounts)
     : null;
+  const previousInputsParsed = prevRaw
+    ? DriftReportSchema.shape.inputs.safeParse(prevRaw.inputs)
+    : null;
+  const prevInputs = previousInputsParsed?.success
+    ? previousInputsParsed.data
+    : null;
   const date = args.reportDate || new Date().toISOString().slice(0, 10);
   const dir = resolvePath(plan.repoRoot, args.reportDir || ".");
   await Deno.mkdir(dir, { recursive: true });
@@ -609,33 +742,76 @@ async function writeReport(
   } else {
     await Deno.writeTextFile(path, `# Drift Report ${date}\n\n${body}`);
   }
-  const perDocCounts: Record<string, number> = {};
-  for (const d of findings.perDoc) {
-    if (d.status === "ok") perDocCounts[d.doc] = d.items.length;
-  }
   const prevCounts = previous?.success ? previous.data : null;
-  const { newDriftDocs, resolvedDocs } = diffCounts(prevCounts, perDocCounts);
+  const docShas = new Map(plan.docs.map((d) => [d.relPath, d.sha256]));
+  const perDocCounts: Record<string, number> = {};
+  const inputs: Record<string, DocInputs> = {};
+  const currentInputs: Record<string, DocInputs> = {};
+  for (const d of findings.perDoc) {
+    if (d.status !== "ok") {
+      // Carry an errored document's last good record forward, so one failed
+      // analysis doesn't reset it to a baseline on the next run.
+      if (prevCounts && d.doc in prevCounts && prevInputs?.[d.doc]) {
+        perDocCounts[d.doc] = prevCounts[d.doc];
+        inputs[d.doc] = prevInputs[d.doc];
+      }
+      continue;
+    }
+    // Watch every file this run or the previous one read for the document;
+    // files that drop out of a reviewer's answer stay watched.
+    const watched = [
+      ...new Set([
+        ...Object.keys(prevInputs?.[d.doc]?.files ?? {}),
+        ...d.codeFilesExamined,
+      ]),
+    ];
+    const di: DocInputs = {
+      docSha: docShas.get(d.doc) ?? "",
+      files: await hashSourceFiles(plan.repoRoot, watched),
+    };
+    perDocCounts[d.doc] = d.items.length;
+    inputs[d.doc] = di;
+    currentInputs[d.doc] = di;
+  }
+  const okCounts = Object.fromEntries(
+    Object.keys(currentInputs).map((doc) => [doc, perDocCounts[doc]]),
+  );
+  const diff = diffCounts({
+    previous: prevCounts,
+    previousInputs: prevInputs,
+    current: okCounts,
+    currentInputs,
+    minNewItems: args.minNewItems,
+  });
   const report = {
     path,
     date,
     sha256: await sha256(await Deno.readTextFile(path)),
     perDocCounts,
+    inputs,
     totalDrift: findings.totals.driftItems,
     errors: findings.perDoc.filter((d) => d.status === "error").map((d) =>
       d.doc
     ),
     previousPerDocCounts: prevCounts,
-    newDriftDocs,
-    newDriftCount: newDriftDocs.length,
-    resolvedDocs,
+    baseline: diff.baseline,
+    baselineDocs: diff.baselineDocs,
+    minNewItems: args.minNewItems,
+    changedDocs: diff.changedDocs,
+    newDriftDocs: diff.newDriftDocs,
+    newDriftCount: diff.newDriftDocs.length,
+    suppressedDocs: diff.suppressedDocs,
+    resolvedDocs: diff.resolvedDocs,
     timestamp: new Date().toISOString(),
   };
   ctx.logger.info(
-    "wrote {path}: {n} drift items, {new} documents with new drift",
+    "wrote {path}: {n} drift items, {new} documents with new drift, {sup} rises suppressed{base}",
     {
       path,
       n: report.totalDrift,
-      new: newDriftDocs.length,
+      new: report.newDriftCount,
+      sup: report.suppressedDocs.length,
+      base: report.baseline ? " (baseline run)" : "",
     },
   );
   const handle = await ctx.writeResource(
@@ -651,8 +827,16 @@ async function writeReport(
 /** Behavior definition for @sntxrr/egm/drift. */
 export const model = {
   type: "@sntxrr/egm/drift",
-  version: "2026.11.17.1",
+  version: "2026.11.17.2",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.11.17.2",
+      description:
+        "No globalArguments change. writeReport gains minNewItems and records input hashes; a previous report without them is treated as a baseline.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     plan: {
       description:

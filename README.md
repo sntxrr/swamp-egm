@@ -63,6 +63,11 @@ swamp workflow run @sntxrr/egm-drift-report \
   --input repoRoot=/path/to/repo --input docsDir=docs --input failOnNewDrift=true
 ```
 
+The first run is a baseline. After that, a document is new drift only when its
+count rose by at least `minNewItems` (default 2) and the document or a source
+file read for it changed, so the model's run-to-run wobble on unchanged code
+doesn't fail the run.
+
 ## Behaviors
 
 | Type | Methods | Data |

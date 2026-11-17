@@ -1,7 +1,7 @@
 {
   "extension": "@sntxrr/egm",
-  "version": "2026.11.17.1",
-  "reviewedAt": "2026-11-17T18:27:11Z",
+  "version": "2026.11.17.2",
+  "reviewedAt": "2026-11-17T21:56:31Z",
   "dimensions": [
     {
       "id": "credentials-secrets",
@@ -16,17 +16,17 @@
     {
       "id": "error-handling",
       "verdict": "pass",
-      "note": "All validation and claude-result checks throw before writeResource; each resource write is parsed through its Zod spec. Errors name the file, batch or finding. try/catch is limited to realPath/stat probes and spawning claude, whose failure is recorded per request as ok=false."
+      "note": "All validation and claude-result checks throw before writeResource; each resource write is parsed through its Zod spec. Errors name the file, batch or finding. try/catch is limited to realPath/stat probes and spawning claude, whose failure is recorded per request as ok=false. hashSourceFiles skips reviewer-supplied paths that resolve outside repoRoot or are not files, and records missing files as absent instead of throwing; a previous report without inputs is treated as a baseline rather than an error."
     },
     {
       "id": "testing-completeness",
       "verdict": "pass",
-      "note": "18 Deno tests across sibling *_test.ts files: success and failure paths for every method (retry/merge, untraced findings, fail-closed presets, drift deltas, demoted contests, unticked edits, stale-document refusal) and cli_generate_many_tools executed against a stub claude on PATH. Uses a hand-written context rather than createModelTestContext. Live runs of all three workflows passed, plus negative controls (all reviewers timing out; resolve rejected; resolve with no findings)."
+      "note": "23 Deno tests across sibling *_test.ts files: success and failure paths for every method, cli_generate_many_tools against a stub claude on PATH, and for drift: first-run and legacy-previous baselines, rises on unchanged inputs suppressed, below-threshold rises, changed-input rises flagged, errored docs carried forward, new docs as baselines, and hashSourceFiles confinement (../, absolute, symlink escape, directories). Live drift runs (Haiku): baseline passed with 6 items; unchanged code 6->7 was suppressed (inputs_unchanged) and passed; a fully matching doc went 0->0, then 0->3 after removing the code and failed at assert-no-new-drift with every earlier step green."
     },
     {
       "id": "idempotency-resilience",
       "verdict": "pass",
-      "note": "Each run gets a fresh batch id, so stale cliResult data from earlier runs is never mixed in; merge refuses findings from another batch. applyFixes backs up first, writes via temp file + rename, and refuses if the document hash changed, so a re-run cannot double-apply."
+      "note": "Each run gets a fresh batch id, so stale cliResult data from earlier runs is never mixed in; merge refuses findings from another batch. applyFixes backs up first, writes via temp file + rename, and refuses if the document hash changed, so a re-run cannot double-apply. Drift: a document whose analysis errors keeps its last good count and inputs, so a transient failure does not reset it to a baseline. The drift behavior ships a no-op upgrade to 2026.11.17.2 (globalArguments unchanged)."
     },
     {
       "id": "api-contracts",
@@ -36,12 +36,12 @@
     {
       "id": "resource-management",
       "verdict": "pass",
-      "note": "Tool-less sessions run in a temp dir removed in finally (covered by a test); every claude subprocess is bound to an AbortSignal timeout plus the method signal."
+      "note": "Tool-less sessions run in a temp dir removed in finally (covered by a test); every claude subprocess is bound to an AbortSignal timeout plus the method signal. Source hashing is capped at 500 files per document, and files over 20 MiB are fingerprinted by size and mtime instead of read."
     },
     {
       "id": "published-surface-hygiene",
       "verdict": "pass",
-      "note": "README, skill and tests use /path/to/repo, docs/design.md and temp dirs. Denylist sweep (comments stripped) and a path/host sweep over every shipped file returned 0 hits."
+      "note": "README, skill and tests use /path/to/repo, docs/design.md and temp dirs. Denylist sweep (45 patterns, comments stripped) and a local path/host sweep over the 2026.11.17.2 diff returned 0 hits."
     },
     {
       "id": "schema-strictness",
@@ -75,8 +75,8 @@
     },
     {
       "id": "version-upgrades",
-      "verdict": "na",
-      "note": "Initial version 2026.11.17.1."
+      "verdict": "pass",
+      "note": "@sntxrr/egm/drift moves to 2026.11.17.2 with a no-op upgrade entry; its globalArguments (repoRoot, docsDir) are unchanged. The new writeReport input has a default, and a previous report written by 2026.11.17.1 (no inputs field) is read as a baseline. @sntxrr/egm and @sntxrr/egm/resolve are unchanged at 2026.11.17.1."
     }
   ]
 }
