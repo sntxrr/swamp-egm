@@ -1,0 +1,11 @@
+@sntxrr/egm
+Copyright 2026 Don O'Neill
+
+This extension includes reviewer persona prompts and document standards
+(egm/prompts/) from the Elephant-Goldfish Model project:
+  https://github.com/google/elephant-goldfish-model
+  commit 72d06f52a2482885d9a64bd24b291c6e8628942c
+  Copyright Google LLC, licensed under the Apache License, Version 2.0.
+They are included unmodified. The Elephant-Goldfish Model is not an
+officially supported Google product, and this extension is not affiliated
+with or endorsed by Google.

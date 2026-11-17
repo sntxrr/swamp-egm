@@ -1,0 +1,173 @@
+# Converted from upstream egm-resolve by @keeb/skill-converter, then hand-finished.
+id: de9457e7-2013-4736-9444-c293c2c0ab24
+name: "@sntxrr/egm-resolve"
+description: >-
+  Resolve Goldfish review findings for a document. Claude (read-only tools,
+  rooted at workingDirectory) categorizes each finding CONTEST / ESCALATE /
+  PROPOSE FIX / DECLINE and proposes exact edits; the rules are enforced in
+  code and goldfish_review_report.md is written. The run then stops at one
+  manual_approval gate. Untick any '[x] apply' line in the report you do not
+  want, then approve to apply the rest (a backup is kept), or reject to apply
+  nothing. Refuses to apply if the document changed after categorization.
+version: 1
+inputs:
+  properties:
+    targetFile:
+      type: string
+      description: Document to resolve, absolute or relative to workingDirectory.
+    lineRange:
+      type: string
+      description: '"full file" or "N-M"; edits must fall inside it.'
+      default: full file
+    workingDirectory:
+      type: string
+      description: Repository root the categorizer may read for CONTEST evidence.
+      default: "."
+    artifactDir:
+      type: string
+      description: Directory for goldfish_review_report.md and the document backup, relative to workingDirectory.
+      default: "."
+    egmModelName:
+      type: string
+      description: The @sntxrr/egm review instance whose findings to resolve (the @sntxrr/egm-review workflow uses egm-doc).
+      default: egm-doc
+    findingsPath:
+      type: string
+      description: Optional findings JSON file instead of egmModelName's data.
+      default: ""
+    contextPaths:
+      type: array
+      items:
+        type: string
+      description: Author design notes or decision records; they stand in for the authoring session's memory.
+      default: []
+    model:
+      type: string
+      default: claude-opus-5-5
+    effort:
+      type: string
+      enum: [low, medium, high, xhigh, max]
+      default: high
+    timeoutSeconds:
+      type: integer
+      default: 900
+  required:
+    - targetFile
+jobs:
+  - name: classify
+    description: Load findings, categorize them, write the annotated report.
+    steps:
+      - name: prepare
+        description: Load the document and findings; build the categorization request.
+        task:
+          type: model_method
+          modelType: "@sntxrr/egm/resolve"
+          modelName: egm-resolve
+          methodName: prepare
+          globalArgs:
+            workingDirectory: ${{ inputs.workingDirectory }}
+            artifactDir: ${{ inputs.artifactDir }}
+          inputs:
+            targetFile: ${{ inputs.targetFile }}
+            lineRange: ${{ inputs.lineRange }}
+            egmModelName: ${{ inputs.egmModelName }}
+            findingsPath: ${{ inputs.findingsPath }}
+            contextPaths: ${{ inputs.contextPaths }}
+
+      - name: classify-findings
+        description: One claude session with read-only tools categorizes every finding and proposes exact edits.
+        dependsOn:
+          - step: prepare
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@keeb/anthropic/claude"
+          modelName: egm-resolve-claude
+          methodName: cli_generate_many_tools
+          globalArgs:
+            model: ${{ inputs.model }}
+          inputs:
+            batch: ${{ data.latest("egm-resolve", "resolveRequest").attributes.batch }}
+            requests: ${{ data.latest("egm-resolve", "resolveRequest").attributes.requests }}
+            cwd: ${{ data.latest("egm-resolve", "resolveRequest").attributes.workingDirectory }}
+            effort: ${{ inputs.effort }}
+            concurrency: 1
+            timeoutSeconds: ${{ inputs.timeoutSeconds }}
+
+      - name: write-report
+        description: Enforce the rules, check every edit applies uniquely, write goldfish_review_report.md.
+        dependsOn:
+          - step: classify-findings
+            condition:
+              type: succeeded
+        task:
+          type: model_method
+          modelType: "@sntxrr/egm/resolve"
+          modelName: egm-resolve
+          methodName: writeReport
+          globalArgs:
+            workingDirectory: ${{ inputs.workingDirectory }}
+            artifactDir: ${{ inputs.artifactDir }}
+          inputs:
+            resultsModel: egm-resolve-claude
+
+      - name: assert-all-classified
+        description: Every finding got exactly one category and no unknown ids came back.
+        dependsOn:
+          - step: write-report
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: data.latest("egm-resolve", "resolution").attributes.allClassified
+          message: The categorization did not cover every finding exactly once; see missingFindingIds, duplicateFindingIds and unknownFindingIds in the egm-resolve resolution data.
+          severity: high
+
+  - name: resolution-gate
+    description: The only human decision; it replaces upstream's chat checkpoint.
+    dependsOn:
+      - job: classify
+        condition:
+          type: succeeded
+    steps:
+      - name: approve-fixes
+        task:
+          type: manual_approval
+          prompt: |-
+            Review goldfish_review_report.md in artifactDir. ESCALATE items are listed first: they need facts only you have and are never edited.
+            Untick '[x] apply' on any edit you do not want.
+            APPROVE: apply the ticked, applicable PROPOSE FIX edits (the original is backed up).
+            REJECT: continue with no changes.
+            Counts: swamp data query 'model("egm-resolve") && name == "resolution"' --select '{"counts": attributes.counts, "applicable": attributes.applicableEditCount}'
+
+  - name: apply
+    description: Apply the approved edits and mark the report resolved.
+    dependsOn:
+      - job: resolution-gate
+        condition:
+          type: succeeded
+    steps:
+      - name: apply-fixes
+        description: Back up the document, apply ticked unique edits in one pass, mark the report resolved.
+        task:
+          type: model_method
+          modelType: "@sntxrr/egm/resolve"
+          modelName: egm-resolve
+          methodName: applyFixes
+          globalArgs:
+            workingDirectory: ${{ inputs.workingDirectory }}
+            artifactDir: ${{ inputs.artifactDir }}
+          inputs: {}
+
+      - name: assert-markdown-valid
+        description: The edited document still has balanced fences and no lost headings.
+        dependsOn:
+          - step: apply-fixes
+            condition:
+              type: succeeded
+        task:
+          type: assert
+          expr: data.latest("egm-resolve", "applyResult").attributes.markdownValid
+          message: The edited document failed the structure checks; restore it from applyResult.backupPath and see markdownIssues.
+          severity: high

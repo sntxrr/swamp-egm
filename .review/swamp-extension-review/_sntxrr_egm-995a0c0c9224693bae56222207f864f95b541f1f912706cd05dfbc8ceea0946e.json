@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/egm",
+  "version": "2026.11.17.1",
+  "reviewedAt": "2026-11-17T18:27:11Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "No credentials are read or stored. Every model call uses the host's claude CLI login; no API key field exists. Nothing secret is logged or written to data."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Every method logs entry and completion with structured placeholders; failed claude requests log a warning with key and error. Prompts and document text are never logged."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "All validation and claude-result checks throw before writeResource; each resource write is parsed through its Zod spec. Errors name the file, batch or finding. try/catch is limited to realPath/stat probes and spawning claude, whose failure is recorded per request as ok=false."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "18 Deno tests across sibling *_test.ts files: success and failure paths for every method (retry/merge, untraced findings, fail-closed presets, drift deltas, demoted contests, unticked edits, stale-document refusal) and cli_generate_many_tools executed against a stub claude on PATH. Uses a hand-written context rather than createModelTestContext. Live runs of all three workflows passed, plus negative controls (all reviewers timing out; resolve rejected; resolve with no findings)."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Each run gets a fresh batch id, so stale cliResult data from earlier runs is never mixed in; merge refuses findings from another batch. applyFixes backs up first, writes via temp file + rename, and refuses if the document hash changed, so a re-run cannot double-apply."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "No HTTP API besides optional fetch of operator-approved URLs (checks res.ok, 20s timeout). claude CLI JSON output is parsed defensively and every model answer is validated with Zod before use."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Tool-less sessions run in a temp dir removed in finally (covered by a test); every claude subprocess is bound to an AbortSignal timeout plus the method signal."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "README, skill and tests use /path/to/repo, docs/design.md and temp dirs. Denylist sweep (comments stripped) and a path/host sweep over every shipped file returned 0 hits."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Resource schemas are plain z.object. The only .passthrough() schemas parse model answers (egm_lib FindingSchema/ReviewerOutputSchema) so extra fields a reviewer adds are kept under rawFindings.extra; they are never resource schemas."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "Every spec sets lifetime infinite with garbageCollection 10 (drift report 30, to keep the run-over-run baseline). cliResult retention is @keeb/anthropic's (30d)."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "Pipeline behaviors (prepare/collect/report), not CRUD lifecycle resources."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "issue",
+      "note": "applyFixes edits a user document but declares no swamp pre-flight checks; its guards are inline (approval gate in the workflow, document-hash match, unique/in-range/non-overlapping edits, backup first). Follow-up: expose the hash and applicability checks as labelled checks."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "One instance per spec, named after the spec (reviewPlan, findings, reports, plan, report, resolveRequest, resolution, applyResult); collectFindings writes the same schema on both passes. cliResult instances are cli-<batch>-<key> with unique keys enforced."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Own state via readResource; other behaviors' results via readModelData filtered by batch. No direct dataRepository access, no shelling out to swamp."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "na",
+      "note": "Initial version 2026.11.17.1."
+    }
+  ]
+}
