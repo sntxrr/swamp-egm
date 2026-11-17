@@ -1,7 +1,7 @@
 manifestVersion: 1
 
 name: "@sntxrr/egm"
-version: "2026.11.17.1"
+version: "2026.11.17.2"
 description: "Elephant-Goldfish Model (egm.dev) design-document review, drift reports and finding resolution as swamp workflows: isolated Goldfish reviewer sessions via the local claude CLI, structured findings, consolidated reports, gated fixes"
 repository: "https://github.com/sntxrr/swamp-egm"
 license: Apache-2.0

@@ -62,8 +62,16 @@ inputs:
       default: 900
     failOnNewDrift:
       type: boolean
-      description: Fail the run when any document's drift count went up since the previous run.
+      description: >-
+        Fail the run on new drift: a document whose drift count rose by at least
+        minNewItems since the previous run AND whose text or a watched file
+        changed (files its session Read, files it reports examining, files the
+        doc links to). The first run is a baseline and never fails.
       default: false
+    minNewItems:
+      type: integer
+      description: Smallest rise in a document's drift count that counts as new drift.
+      default: 2
   required:
     - repoRoot
     - docsDir
@@ -155,6 +163,7 @@ jobs:
             reportDir: ${{ inputs.reportDir }}
             reportDate: ${{ inputs.reportDate }}
             append: ${{ inputs.appendReport }}
+            minNewItems: ${{ inputs.minNewItems }}
 
       - name: assert-all-docs-analyzed
         description: Every document must have a valid analysis. Failures appear in the report as [error] entries.
@@ -178,5 +187,5 @@ jobs:
         task:
           type: assert
           expr: data.latest("egm-drift", "report").attributes.newDriftCount == 0
-          message: New drift since the previous run; see newDriftDocs in the egm-drift report data.
+          message: New drift since the previous run (count rose by at least minNewItems and the inputs changed); see newDriftDocs in the egm-drift report data.
           severity: high

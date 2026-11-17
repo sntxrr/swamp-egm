@@ -1,6 +1,5 @@
 // Tests for the @sntxrr/egm/resolve behavior, with fake cliResult records.
 import {
-  assert,
   assertEquals,
   assertRejects,
   assertStringIncludes,
@@ -44,27 +43,6 @@ function fakeCtx(
 // deno-lint-ignore no-explicit-any
 const run = (method: { execute: any }, args: unknown, ctx: unknown) =>
   method.execute(args, ctx);
-
-const DOC = [
-  "# Widget service",
-  "",
-  "Widgets are cached. See [the cache](cache.md) and [outside](../../etc/hosts) and [web](https://example.com/x).",
-  "",
-  "```md",
-  "## Implementation Plan",
-  "```",
-  "",
-  "## Detailed Implementation Plan",
-  "",
-  "1. Add `WidgetCache` in src/cache.ts.",
-].join("\n");
-
-async function repoWithDoc(): Promise<string> {
-  const dir = await Deno.makeTempDir({ prefix: "egm-test-" });
-  await Deno.writeTextFile(`${dir}/design.md`, DOC + "\n");
-  await Deno.writeTextFile(`${dir}/cache.md`, "cache notes\n");
-  return dir;
-}
 
 // ---------------------------------------------------------------- resolve
 
