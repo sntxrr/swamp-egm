@@ -1,7 +1,7 @@
 {
   "extension": "@sntxrr/egm",
   "version": "2026.11.17.2",
-  "reviewedAt": "2026-11-17T21:56:31Z",
+  "reviewedAt": "2026-11-17T22:17:32Z",
   "dimensions": [
     {
       "id": "credentials-secrets",
@@ -21,7 +21,7 @@
     {
       "id": "testing-completeness",
       "verdict": "pass",
-      "note": "23 Deno tests across sibling *_test.ts files: success and failure paths for every method, cli_generate_many_tools against a stub claude on PATH, and for drift: first-run and legacy-previous baselines, rises on unchanged inputs suppressed, below-threshold rises, changed-input rises flagged, errored docs carried forward, new docs as baselines, and hashSourceFiles confinement (../, absolute, symlink escape, directories). Live drift runs (Haiku): baseline passed with 6 items; unchanged code 6->7 was suppressed (inputs_unchanged) and passed; a fully matching doc went 0->0, then 0->3 after removing the code and failed at assert-no-new-drift with every earlier step green."
+      "note": "26 Deno tests across sibling *_test.ts files: success and failure paths for every method; cli_generate_many_tools against a stub claude on PATH that emits stream-json, asserting the toolUse resource is written for tool-enabled requests only; stream-json parsing (last result event, Read/Grep/Glob extraction, dedup, cwd-relative paths, a session killed mid-stream keeps its reads and is ok=false); legacy single-object JSON still parses. Drift: first-run and legacy baselines, unchanged-input rises suppressed, below-threshold rises, changed-input rises flagged, errored docs carried forward, new docs as baselines, hashSourceFiles confinement, doc-link resolution, and a change to a file the session Read but did not self-report flagged as new drift. Live (Haiku): egm-review stages 5+9 succeeded on the stream-json parser (5/5 reviewers, 27 findings, all traced, toolUse written); drift baseline 6 passed, unchanged 6->7 suppressed and passed, matching doc 0->0, then 0->3 after removing code failed at assert-no-new-drift (twice, before and after the stream-json change); recorded filesRead matched the files opened."
     },
     {
       "id": "idempotency-resilience",
@@ -31,12 +31,12 @@
     {
       "id": "api-contracts",
       "verdict": "pass",
-      "note": "No HTTP API besides optional fetch of operator-approved URLs (checks res.ok, 20s timeout). claude CLI JSON output is parsed defensively and every model answer is validated with Zod before use."
+      "note": "No HTTP API besides optional fetch of operator-approved URLs (checks res.ok, 20s timeout). claude CLI JSON output is parsed defensively and every model answer is validated with Zod before use. claude is now run with --output-format stream-json --verbose; the outcome comes from the last result event (same fields as json output), truncated lines are skipped, and a bare json object is still accepted."
     },
     {
       "id": "resource-management",
       "verdict": "pass",
-      "note": "Tool-less sessions run in a temp dir removed in finally (covered by a test); every claude subprocess is bound to an AbortSignal timeout plus the method signal. Source hashing is capped at 500 files per document, and files over 20 MiB are fingerprinted by size and mtime instead of read."
+      "note": "Tool-less sessions run in a temp dir removed in finally (covered by a test); every claude subprocess is bound to an AbortSignal timeout plus the method signal. Source hashing is capped at 500 files per document, and files over 20 MiB are fingerprinted by size and mtime instead of read. stream-json output includes tool results, so per-session stdout is larger; it is bounded by one session and parsed line by line."
     },
     {
       "id": "published-surface-hygiene",
@@ -51,7 +51,7 @@
     {
       "id": "lifetime-gc",
       "verdict": "pass",
-      "note": "Every spec sets lifetime infinite with garbageCollection 10 (drift report 30, to keep the run-over-run baseline). cliResult retention is @keeb/anthropic's (30d)."
+      "note": "Every spec sets lifetime infinite with garbageCollection 10 (drift report 30, to keep the run-over-run baseline). cliResult retention is @keeb/anthropic's (30d). The extension-declared toolUse spec on @keeb/anthropic/claude is lifetime infinite with garbageCollection 10."
     },
     {
       "id": "crud-completeness",
@@ -71,7 +71,7 @@
     {
       "id": "data-access",
       "verdict": "pass",
-      "note": "Own state via readResource; other behaviors' results via readModelData filtered by batch. No direct dataRepository access, no shelling out to swamp."
+      "note": "Own state via readResource; other behaviors' results via readModelData filtered by batch. No direct dataRepository access, no shelling out to swamp. Drift reads toolUse records from the results instance filtered by spec and batch; review and resolve read only cliResult, so the extra records do not affect them."
     },
     {
       "id": "version-upgrades",

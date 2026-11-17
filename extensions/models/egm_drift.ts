@@ -11,8 +11,8 @@
  * upstream egm-drift-report's strict per-document format and records
  * per-document drift counts and input hashes against the previous run, so a
  * scheduled run can fail on new drift. Counts are model output and vary on
- * unchanged code, so a rise counts as new drift only when the document or a
- * source file read for it changed (see `diffCounts`).
+ * unchanged code, so a rise counts as new drift only when the document or one
+ * of its watched files changed (see `diffCounts` and `writeReport`).
  *
  * Upstream: https://github.com/google/elephant-goldfish-model (Apache-2.0).
  *
@@ -22,6 +22,7 @@ import { z } from "npm:zod@4";
 import { expandGlob } from "jsr:@std/fs@1.0.24/expand-glob";
 import { globToRegExp } from "jsr:@std/path@1.1.6/glob-to-regexp";
 import { READONLY_TOOLS } from "./egm_claude_tools.ts";
+import { extractLinks, isUrl } from "./egm_lib.ts";
 
 // ---------------------------------------------------------------- schemas
 
@@ -135,6 +136,8 @@ const PerDocSchema = z.object({
     suggestedPath: z.string(),
   })),
   codeFilesExamined: z.array(z.string()),
+  /** Files the session actually Read, from claude's recorded tool calls. */
+  filesRead: z.array(z.string()).default([]),
 });
 
 const DriftFindingsSchema = z.object({
@@ -159,7 +162,9 @@ type DriftFindings = z.infer<typeof DriftFindingsSchema>;
 
 /**
  * What a document's drift answer was based on: the document's hash and the
- * hash of every source file a reviewer read for it ("absent" when missing).
+ * hash of every watched source file ("absent" when missing): files the
+ * session Read (recorded tool calls), files it self-reports in
+ * codeFilesExamined, files the document links to, and files watched before.
  */
 const DocInputsSchema = z.object({
   docSha: z.string(),
@@ -450,12 +455,17 @@ const CollectArgs = z.object({
 export function unreferencedFiles(
   sourceFiles: string[],
   docTexts: string[],
-  perDoc: { items: { codeRef: string }[]; codeFilesExamined: string[] }[],
+  perDoc: {
+    items: { codeRef: string }[];
+    codeFilesExamined: string[];
+    filesRead?: string[];
+  }[],
 ): string[] {
   const haystack = [
     ...docTexts,
     ...perDoc.flatMap((d) => [
       ...d.codeFilesExamined,
+      ...(d.filesRead ?? []),
       ...d.items.map((i) => i.codeRef),
     ]),
   ].join("\n");
@@ -485,6 +495,15 @@ async function collectFindings(
       results.set(String(r.attributes.key), r.attributes);
     }
   }
+  // What each session really opened, recorded by cli_generate_many_tools.
+  const reads = new Map<string, string[]>();
+  for (const r of await ctx.readModelData(args.resultsModel, "toolUse")) {
+    if (
+      r.attributes.batch === plan.batch && Array.isArray(r.attributes.reads)
+    ) {
+      reads.set(String(r.attributes.key), r.attributes.reads.map(String));
+    }
+  }
   const perDoc: DriftFindings["perDoc"] = [];
   let costUsd = 0;
   for (const d of plan.docs) {
@@ -499,6 +518,7 @@ async function collectFindings(
         items: [],
         missingLinks: [],
         codeFilesExamined: [],
+        filesRead: reads.get(d.key) ?? [],
       });
     if (!rec) {
       fail("no result recorded");
@@ -537,6 +557,7 @@ async function collectFindings(
       items: v.items,
       missingLinks: v.missingLinks,
       codeFilesExamined: v.codeFilesExamined,
+      filesRead: reads.get(d.key) ?? [],
     });
   }
   let unref: string[] = [];
@@ -626,7 +647,32 @@ export function renderDriftReport(f: DriftFindings): string {
   return out.join("\n");
 }
 
-/** True when a document or any source file read for it changed. Exported for tests. */
+/**
+ * Repo-relative paths of the local files a document links to (URLs, anchors
+ * and links that climb out of the repo are dropped). Exported for tests.
+ */
+export function docLinkedFiles(docRelPath: string, text: string): string[] {
+  const dir = docRelPath.includes("/")
+    ? docRelPath.slice(0, docRelPath.lastIndexOf("/"))
+    : "";
+  const out = new Set<string>();
+  for (const link of extractLinks(text)) {
+    if (isUrl(link) || link.startsWith("/")) continue;
+    const parts: string[] = dir ? dir.split("/") : [];
+    let escaped = false;
+    for (const seg of decodeURI(link).split("/")) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") {
+        if (parts.length === 0) escaped = true;
+        else parts.pop();
+      } else parts.push(seg);
+    }
+    if (!escaped && parts.length > 0) out.add(parts.join("/"));
+  }
+  return [...out];
+}
+
+/** True when a document or any source file watched for it changed. Exported for tests. */
 export function inputsChanged(
   previous: DocInputs | undefined,
   current: DocInputs,
@@ -643,8 +689,8 @@ type CountChange = { doc: string; previous: number; current: number };
  * Compares this run's counts with the previous run's. Drift counts are model
  * output and wobble by an item or two on unchanged code, so a document is new
  * drift only when (1) there was a previous run that recorded its inputs, (2)
- * its count rose by at least minNewItems, and (3) the document or a source
- * file read for it changed. A first run, a previous run from before inputs
+ * its count rose by at least minNewItems, and (3) the document or one of its
+ * watched files changed. A first run, a previous run from before inputs
  * were recorded, and a document seen for the first time are baselines.
  * Exported for tests.
  */
@@ -744,6 +790,7 @@ async function writeReport(
   }
   const prevCounts = previous?.success ? previous.data : null;
   const docShas = new Map(plan.docs.map((d) => [d.relPath, d.sha256]));
+  const docPaths = new Map(plan.docs.map((d) => [d.relPath, d.absPath]));
   const perDocCounts: Record<string, number> = {};
   const inputs: Record<string, DocInputs> = {};
   const currentInputs: Record<string, DocInputs> = {};
@@ -757,12 +804,18 @@ async function writeReport(
       }
       continue;
     }
-    // Watch every file this run or the previous one read for the document;
-    // files that drop out of a reviewer's answer stay watched.
+    // Watch the files the session really Read (recorded tool calls), the
+    // files it says it examined, the files the document links to, and every
+    // file watched on earlier runs, so a file that drops out stays watched.
+    const docText = await Deno.readTextFile(docPaths.get(d.doc) ?? "").catch(
+      () => "",
+    );
     const watched = [
       ...new Set([
         ...Object.keys(prevInputs?.[d.doc]?.files ?? {}),
+        ...d.filesRead,
         ...d.codeFilesExamined,
+        ...docLinkedFiles(d.doc, docText),
       ]),
     ];
     const di: DocInputs = {

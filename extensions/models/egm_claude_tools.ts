@@ -12,6 +12,11 @@
  *
  * Results land in the base type's `cliResult` resource, instance
  * `cli-<batch>-<key>`, with the same fields `cli_generate_many` writes.
+ * claude runs with `--output-format stream-json`, so the tool calls a session
+ * actually made are recorded too: each tool-enabled request also writes a
+ * `toolUse` resource (declared by this extension), instance
+ * `tools-<batch>-<key>`, listing the files it Read and the Grep/Glob searches
+ * it ran, relative to `cwd`.
  *
  * @module
  */
@@ -57,6 +62,27 @@ export const ToolBatchArgsSchema = z.object({
   timeoutSeconds: z.number().int().positive().default(900),
 });
 
+/** Tool calls one session made, as recorded in its stream-json output. */
+export interface ToolUse {
+  /** `Read` file paths, relative to cwd when inside it. */
+  reads: string[];
+  /** `Grep` and `Glob` calls: the tool, its pattern and its search path. */
+  searches: { tool: string; pattern: string; path: string }[];
+}
+
+/** Schema of the `toolUse` resource this extension adds. */
+export const ToolUseSchema = z.object({
+  key: z.string(),
+  batch: z.string(),
+  reads: z.array(z.string()),
+  searches: z.array(z.object({
+    tool: z.string(),
+    pattern: z.string(),
+    path: z.string(),
+  })),
+  timestamp: z.string(),
+});
+
 /** Outcome of one claude invocation. */
 export interface CliOutcome {
   ok: boolean;
@@ -66,6 +92,7 @@ export interface CliOutcome {
   model: string;
   costUsd: number;
   durationMs: number;
+  toolUse: ToolUse;
 }
 
 /** Builds the claude CLI argument list for one request. Exported for tests. */
@@ -76,7 +103,8 @@ export function buildClaudeArgs(
   const args = [
     "-p",
     "--output-format",
-    "json",
+    "stream-json",
+    "--verbose",
     "--no-session-persistence",
     "--safe-mode",
     "--restricted",
@@ -98,28 +126,92 @@ export function buildClaudeArgs(
   return args;
 }
 
-/** Parses `claude -p --output-format json` stdout into an outcome. Exported for tests. */
+function relToCwd(p: string, cwd?: string): string {
+  if (!cwd) return p;
+  const root = cwd.endsWith("/") ? cwd : `${cwd}/`;
+  if (p === cwd) return ".";
+  return p.startsWith(root) ? p.slice(root.length) : p;
+}
+
+/**
+ * Splits claude output into events. stream-json is one JSON object per line;
+ * a single `--output-format json` object is accepted too.
+ */
+function parseEvents(stdout: string): Record<string, unknown>[] {
+  const events: Record<string, unknown>[] = [];
+  for (const line of stdout.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("{")) continue;
+    try {
+      const v = JSON.parse(t);
+      if (v && typeof v === "object") events.push(v);
+    } catch {
+      // a truncated last line (timeout, kill) is expected; skip it
+    }
+  }
+  if (events.length === 0) {
+    try {
+      const v = JSON.parse(stdout);
+      if (v && typeof v === "object") events.push(v);
+    } catch {
+      // not JSON at all; the caller reports it
+    }
+  }
+  return events;
+}
+
+/** Collects the Read, Grep and Glob calls from stream-json events. Exported for tests. */
+export function extractToolUse(
+  events: Record<string, unknown>[],
+  cwd?: string,
+): ToolUse {
+  const reads = new Set<string>();
+  const searches: ToolUse["searches"] = [];
+  for (const e of events) {
+    if (e.type !== "assistant") continue;
+    const content = (e.message as { content?: unknown } | undefined)?.content;
+    if (!Array.isArray(content)) continue;
+    for (const c of content) {
+      if (!c || c.type !== "tool_use") continue;
+      const input = (c.input ?? {}) as Record<string, unknown>;
+      if (c.name === "Read" && typeof input.file_path === "string") {
+        reads.add(relToCwd(input.file_path, cwd));
+      } else if (c.name === "Grep" || c.name === "Glob") {
+        searches.push({
+          tool: c.name,
+          pattern: String(input.pattern ?? ""),
+          path: relToCwd(String(input.path ?? cwd ?? "."), cwd),
+        });
+      }
+    }
+  }
+  return { reads: [...reads], searches };
+}
+
+/** Parses `claude -p` stream-json (or json) stdout into an outcome. Exported for tests. */
 export function parseClaudeOutput(
   stdout: string,
   stderr: string,
   code: number,
   model: string,
   durationMs: number,
+  cwd?: string,
 ): CliOutcome {
-  let parsed: Record<string, unknown> | null = null;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch {
-    parsed = null;
-  }
-  if (!parsed || typeof parsed !== "object") {
+  const events = parseEvents(stdout);
+  const toolUse = extractToolUse(events, cwd);
+  const parsed =
+    [...events].reverse().find((e) =>
+      e.type === "result" || e.type === undefined
+    ) ?? null;
+  if (!parsed) {
     return {
       ok: false,
       response: "",
-      error: `claude exited ${code}: ${(stderr || stdout).slice(0, 2000)}`,
+      error: `claude exited ${code}: ${(stderr || stdout).slice(-2000)}`,
       model,
       costUsd: 0,
       durationMs,
+      toolUse,
     };
   }
   const usage = parsed.modelUsage as Record<string, unknown> | undefined;
@@ -137,6 +229,7 @@ export function parseClaudeOutput(
     model: servedBy,
     costUsd: Number(parsed.total_cost_usd ?? 0),
     durationMs,
+    toolUse,
   };
 }
 
@@ -174,6 +267,7 @@ async function invoke(
       out.code,
       opts.model,
       Date.now() - started,
+      useTools ? cwd : undefined,
     );
   } catch (err) {
     return {
@@ -185,6 +279,7 @@ async function invoke(
       model: opts.model,
       costUsd: 0,
       durationMs: Date.now() - started,
+      toolUse: { reads: [], searches: [] },
     };
   } finally {
     if (tmp) await Deno.remove(tmp, { recursive: true }).catch(() => {});
@@ -227,6 +322,15 @@ interface Ctx {
 /** Extension adding cli_generate_many_tools to @keeb/anthropic/claude. */
 export const extension = {
   type: "@keeb/anthropic/claude",
+  resources: {
+    toolUse: {
+      description:
+        "Files a tool-enabled cli_generate_many_tools request actually Read, and the Grep/Glob searches it ran, from claude's stream-json output",
+      schema: ToolUseSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+  },
   methods: [
     {
       cli_generate_many_tools: {
@@ -311,6 +415,21 @@ export const extension = {
                 },
               ),
             );
+            if (r.tools.length > 0) {
+              handles.push(
+                await context.writeResource(
+                  "toolUse",
+                  `tools-${args.batch}-${r.key}`,
+                  ToolUseSchema.parse({
+                    key: r.key,
+                    batch: args.batch,
+                    reads: o.toolUse.reads,
+                    searches: o.toolUse.searches,
+                    timestamp: new Date().toISOString(),
+                  }),
+                ),
+              );
+            }
           }
           return { dataHandles: handles };
         },

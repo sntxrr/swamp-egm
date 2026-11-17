@@ -7,6 +7,7 @@ import {
 import {
   diffCounts,
   type DocInputs,
+  docLinkedFiles,
   docKey,
   hashSourceFiles,
   inputsChanged,
@@ -52,9 +53,9 @@ Deno.test("drift helpers: keys, unreferenced files, diffs, strict render", () =>
   const body = renderDriftReport({
     batch: "b",
     perDoc: [
-      { doc: "a.md", status: "ok", noDrift: true, items: [], missingLinks: [], codeFilesExamined: [] },
-      { doc: "b.md", status: "ok", noDrift: false, items: [{ category: "missing_feature", description: "no cache", docRef: "§2", codeRef: "absent" }], missingLinks: [], codeFilesExamined: [] },
-      { doc: "c.md", status: "error", error: "timeout", noDrift: false, items: [], missingLinks: [], codeFilesExamined: [] },
+      { doc: "a.md", status: "ok", noDrift: true, items: [], missingLinks: [], codeFilesExamined: [], filesRead: [] },
+      { doc: "b.md", status: "ok", noDrift: false, items: [{ category: "missing_feature", description: "no cache", docRef: "§2", codeRef: "absent" }], missingLinks: [], codeFilesExamined: [], filesRead: [] },
+      { doc: "c.md", status: "error", error: "timeout", noDrift: false, items: [], missingLinks: [], codeFilesExamined: [], filesRead: [] },
     ],
     coverage: { checked: false, unreferencedFiles: [] },
     totals: { docs: 3, docsWithDrift: 1, driftItems: 1, errors: 1, byCategory: {} },
@@ -103,6 +104,12 @@ Deno.test("inputsChanged: doc hash, changed or vanished file", () => {
   assert(inputsChanged(undefined, inp("d")));
 });
 
+Deno.test("docLinkedFiles: resolves relative links, drops URLs, anchors and escapes", () => {
+  const md = "[c](../src/config.ts) [m](../src/math.ts#L3) [w](https://x.y/a) [a](#top) [up](../../etc/hosts) [abs](/etc/hosts) [s](./sib.md)";
+  assertEquals(docLinkedFiles("docs/math.md", md), ["src/config.ts", "src/math.ts", "docs/sib.md"]);
+  assertEquals(docLinkedFiles("top.md", "[x](../out.ts) [y](src/a.ts)"), ["src/a.ts"]);
+});
+
 Deno.test("hashSourceFiles: confined to repoRoot, absent files marked, refs trimmed", async () => {
   const root = await Deno.realPath(await Deno.makeTempDir());
   const outside = await Deno.makeTempDir();
@@ -116,6 +123,36 @@ Deno.test("hashSourceFiles: confined to repoRoot, absent files marked, refs trim
   assertEquals(h["src/a.ts"].length, 64);
   await Deno.remove(root, { recursive: true });
   await Deno.remove(outside, { recursive: true });
+});
+
+Deno.test("drift: a change to a file the session Read but did not self-report is new drift", async () => {
+  const dir = await Deno.makeTempDir();
+  await Deno.mkdir(`${dir}/docs`);
+  await Deno.mkdir(`${dir}/src`);
+  await Deno.writeTextFile(`${dir}/src/hidden.ts`, "export const v = 1;\n");
+  await Deno.writeTextFile(`${dir}/docs/a.md`, "# A\nno links here\n");
+  const { ctx, own, other } = fakeCtx({ repoRoot: dir, docsDir: "docs" });
+  const item = { category: "missing_feature", description: "x", docRef: "A", codeRef: "absent" };
+  const cycle = async (n: number) => {
+    await run(drift.methods.prepare, {}, ctx);
+    const plan = own.get("plan")!;
+    const [d] = plan.docs as { key: string; relPath: string }[];
+    const items = Array.from({ length: n }, () => item);
+    other["egm-drift-claude"] = [
+      { name: `cli-${plan.batch}-${d.key}`, attributes: { batch: plan.batch, key: d.key, ok: true, structured: { noDrift: n === 0, items, missingLinks: [], codeFilesExamined: [] } } },
+      // the reviewer opened src/hidden.ts but left it out of codeFilesExamined
+      { name: `tools-${plan.batch}-${d.key}`, specName: "toolUse", attributes: { batch: plan.batch, key: d.key, reads: ["src/hidden.ts"], searches: [] } },
+    ];
+    await run(drift.methods.collectFindings, {}, ctx);
+    await run(drift.methods.writeReport, { reportDate: "2026-11-17" }, ctx);
+    return own.get("report")!;
+  };
+  await cycle(0);
+  assertEquals(Object.keys((own.get("report")!.inputs as Record<string, DocInputs>)["docs/a.md"].files), ["src/hidden.ts"]);
+  await Deno.writeTextFile(`${dir}/src/hidden.ts`, "export const v = 2;\n");
+  const second = await cycle(2);
+  assertEquals(second.newDriftDocs, [{ doc: "docs/a.md", previous: 0, current: 2 }]);
+  await Deno.remove(dir, { recursive: true });
 });
 
 Deno.test("drift: prepare → collect → writeReport: baseline, wobble suppressed, real change flagged", async () => {

@@ -64,8 +64,9 @@ inputs:
       type: boolean
       description: >-
         Fail the run on new drift: a document whose drift count rose by at least
-        minNewItems since the previous run AND whose text or a source file read
-        for it changed. The first run is a baseline and never fails.
+        minNewItems since the previous run AND whose text or a watched file
+        changed (files its session Read, files it reports examining, files the
+        doc links to). The first run is a baseline and never fails.
       default: false
     minNewItems:
       type: integer

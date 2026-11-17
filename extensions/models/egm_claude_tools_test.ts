@@ -9,6 +9,7 @@ import {
 import {
   buildClaudeArgs,
   extension,
+  extractToolUse,
   parseClaudeOutput,
   ToolRequestSchema,
 } from "./egm_claude_tools.ts";
@@ -28,6 +29,8 @@ Deno.test("buildClaudeArgs: tool-less vs read-only, always restricted and safe",
     assert(none.includes(f) && ro.includes(f), f);
   }
   assertEquals(ro[ro.indexOf("--json-schema") + 1], '{"type":"object"}');
+  assertEquals(ro[ro.indexOf("--output-format") + 1], "stream-json");
+  assert(ro.includes("--verbose"), "stream-json needs --verbose in -p mode");
 });
 
 Deno.test("ToolRequestSchema rejects write or exec tools and bad keys", () => {
@@ -43,6 +46,33 @@ Deno.test("parseClaudeOutput maps errors and structured output", () => {
   assertEquals(parseClaudeOutput(JSON.stringify({ is_error: true, subtype: "error_max_turns" }), "", 0, "m", 1).ok, false);
 });
 
+const toolUseEvent = (name: string, input: Record<string, unknown>) =>
+  JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name, input }] } });
+
+Deno.test("parseClaudeOutput reads stream-json: last result event, recorded tool calls", () => {
+  const stream = [
+    JSON.stringify({ type: "system", subtype: "init" }),
+    toolUseEvent("Read", { file_path: "/repo/src/a.ts" }),
+    toolUseEvent("Read", { file_path: "/repo/src/a.ts" }),
+    toolUseEvent("Grep", { pattern: "max", path: "/repo/src" }),
+    toolUseEvent("Glob", { pattern: "**/*.ts" }),
+    toolUseEvent("Read", { file_path: "/elsewhere/x" }),
+    toolUseEvent("StructuredOutput", { a: 1 }),
+    JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "{}", structured_output: { a: 1 }, total_cost_usd: 0.2, modelUsage: { "claude-y": {} } }),
+  ].join("\n");
+  const o = parseClaudeOutput(stream, "", 0, "m", 1, "/repo");
+  assertEquals([o.ok, o.structured, o.costUsd, o.model], [true, { a: 1 }, 0.2, "claude-y"]);
+  assertEquals(o.toolUse.reads, ["src/a.ts", "/elsewhere/x"]);
+  assertEquals(o.toolUse.searches, [
+    { tool: "Grep", pattern: "max", path: "src" },
+    { tool: "Glob", pattern: "**/*.ts", path: "." },
+  ]);
+  // a session killed mid-stream: no result event, but its reads are kept
+  const cut = parseClaudeOutput([toolUseEvent("Read", { file_path: "/repo/b.ts" }), '{"type":"assis'].join("\n"), "", 143, "m", 1, "/repo");
+  assertEquals([cut.ok, cut.toolUse.reads], [false, ["b.ts"]]);
+  assertEquals(extractToolUse([]).reads, []);
+});
+
 // ---------------------------------------------------------------- execute with a stub claude
 
 const STUB = `#!/usr/bin/env bash
@@ -51,7 +81,9 @@ prompt="$(cat)"
 printf '%s\\t%s\\t%s\\n' "$(pwd -P)" "$*" "$prompt" >> "$EGM_STUB_LOG"
 case "$prompt" in
   *FAIL*) echo "boom" >&2; exit 1 ;;
-  *) printf '{"result":"done","structured_output":{"ok":true},"total_cost_usd":0.01}' ;;
+  *read*) printf '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"%s/src/x.ts"}}]}}\n' "$(pwd -P)"
+          printf '{"type":"result","is_error":false,"result":"done","structured_output":{"ok":true},"total_cost_usd":0.01}\n' ;;
+  *) printf '{"type":"result","is_error":false,"result":"done","structured_output":{"ok":true},"total_cost_usd":0.01}\n' ;;
 esac
 `;
 
@@ -82,7 +114,8 @@ function toolsCtx() {
       globalArgs: { model: "claude-test" },
       logger: { info: () => {}, warning: () => {} },
       writeResource: (spec: string, name: string, data: Record<string, unknown>) => {
-        assertEquals(spec, "cliResult");
+        assert(spec === "cliResult" || spec === "toolUse", spec);
+        assertEquals(spec === "toolUse", name.startsWith("tools-"));
         written.set(name, data);
         return Promise.resolve({ name });
       },
@@ -105,7 +138,9 @@ Deno.test("cli_generate_many_tools: isolation, cwd confinement, failures stored"
         { key: "bad", prompt: "please FAIL" },
       ],
     }, ctx);
-    assertEquals([...written.keys()].sort(), ["cli-b1-bad", "cli-b1-coder", "cli-b1-plain"]);
+    assertEquals([...written.keys()].sort(), ["cli-b1-bad", "cli-b1-coder", "cli-b1-plain", "tools-b1-coder"]);
+    assertEquals(written.get("tools-b1-coder")!.reads, ["src/x.ts"]);
+    assertEquals(written.get("cli-b1-coder")!.structured, { ok: true });
     assertEquals(written.get("cli-b1-plain")!.ok, true);
     assertEquals(written.get("cli-b1-plain")!.structured, { ok: true });
     assertEquals(written.get("cli-b1-bad")!.ok, false);

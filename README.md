@@ -64,9 +64,16 @@ swamp workflow run @sntxrr/egm-drift-report \
 ```
 
 The first run is a baseline. After that, a document is new drift only when its
-count rose by at least `minNewItems` (default 2) and the document or a source
-file read for it changed, so the model's run-to-run wobble on unchanged code
+count rose by at least `minNewItems` (default 2) and the document or one of
+its watched files changed, so the model's run-to-run wobble on unchanged code
 doesn't fail the run.
+
+A document's watched files are the files its session actually opened with
+`Read` (from claude's recorded tool calls), the files it lists in
+`codeFilesExamined`, the local files the document links to, and every file
+watched on earlier runs. A file the reviewer only matched with `Grep` or
+`Glob`, without opening it, isn't watched, so check `suppressedDocs` in the
+report data now and then for real drift this gate held back.
 
 ## Behaviors
 
